@@ -329,51 +329,47 @@ static int mini_validate_task_lkrg_style(struct mini_proc_info *info, struct tas
 
 static int mini_add_task(struct task_struct *task)
 {
-	struct mini_proc_info *info;
-	unsigned long flags;
+    struct mini_proc_info *info;
+    unsigned long flags;
 
-	if (task->flags & PF_KTHREAD || !task->mm) // Ignore kernel threads and tasks without mm
-		return 0;
+    if (task->flags & PF_KTHREAD || !task->mm) // Ignore kernel threads and tasks without mm
+        return 0;
 
-	if (task == current) // Ignore self
-		return 0;
+    info = kmalloc(sizeof(*info), GFP_ATOMIC);
+    if (!info) {
+        pr_err("minidetect: Failed to allocate memory for PID %d\n", task->pid);
+        return -ENOMEM;
+    }
 
-	info = kmalloc(sizeof(*info), GFP_ATOMIC);
-	if (!info) {
-		pr_err("minidetect: Failed to allocate memory for PID %d\n", task->pid);
-		return -ENOMEM;
-	}
+    info->pid = task->pid;
+    info->cred_ptr = NULL;
+    info->real_cred_ptr = NULL;
 
-	info->pid = task->pid;
-	info->cred_ptr = NULL;
-	info->real_cred_ptr = NULL;
+    spin_lock_irqsave(&proc_info_lock, flags);
 
-	spin_lock_irqsave(&proc_info_lock, flags);
+    // Check if already exists
+    {
+        struct mini_proc_info *existing_info;
+        hash_for_each_possible(proc_info_table, existing_info, hash_node, task->pid) {
+            if (existing_info->pid == task->pid) {
+                // Already exists, but update baseline anyway to ensure fresh state
+                mini_update_baseline(existing_info, task);
+                spin_unlock_irqrestore(&proc_info_lock, flags);
+                kfree(info);
+                return 0;
+            }
+        }
+    }
 
-	// Check if already exists
-	{
-		struct mini_proc_info *existing_info;
-		bool already_exists = false;
-		hash_for_each_possible(proc_info_table, existing_info, hash_node, task->pid) {
-			if (existing_info->pid == task->pid) {
-				already_exists = true;
-				break;
-			}
-		}
-		if (already_exists) {
-			spin_unlock_irqrestore(&proc_info_lock, flags);
-			kfree(info);
-			return 0; // Already tracked
-		}
-	}
+    // New task, add it
+    hash_add(proc_info_table, &info->hash_node, info->pid);
+    mini_reset_validation_flags(info);
+    mini_update_baseline(info, task);
 
-	hash_add(proc_info_table, &info->hash_node, info->pid);
-	mini_reset_validation_flags(info);
-	mini_update_baseline(info, task); // Takes initial references
-
-	spin_unlock_irqrestore(&proc_info_lock, flags);
-
-	return 0;
+    spin_unlock_irqrestore(&proc_info_lock, flags);
+    
+    pr_info("minidetect: Started monitoring new task PID %d (%s)\n", task->pid, task->comm);
+    return 0;
 }
 
 static void mini_remove_task(pid_t pid)
@@ -546,24 +542,24 @@ static int kret_security_bprm_committed_creds_handler(struct kretprobe_instance 
     struct task_struct *task = current;
     struct mini_proc_info *info;
     unsigned long flags;
-    int validation_result = 0;
 
     if (task->flags & PF_KTHREAD || !task->mm) return 0;
 
     spin_lock_irqsave(&proc_info_lock, flags);
     info = mini_find_task_info_locked(task->pid);
-    if (info) {
-        mini_set_validation_on(info);
-        validation_result = mini_validate_task_lkrg_style(info, task, "bprm_committed_creds");
+    if (!info) {
+        // Task is new from execve, add it first
+        spin_unlock_irqrestore(&proc_info_lock, flags);
+        mini_add_task(task);  // This will create new baseline
+        return 0;
+    }
 
-        if (validation_result == 0) {
-            mini_update_baseline(info, task); // Update baseline to post-execve state
-        } else {
-            pr_alert("minidetect: [bprm_committed_creds] Validation failed for PID %d post-exec, baseline NOT updated.\n", task->pid);
-        }
+    // Existing task, validate and update baseline
+    mini_set_validation_on(info);
+    if (mini_validate_task_lkrg_style(info, task, "bprm_committed_creds") == 0) {
+        mini_update_baseline(info, task);
     } else {
-        // Task might be new from execve, attempt to add it.
-		mini_add_task(task);
+        pr_alert("minidetect: [bprm_committed_creds] Validation failed for PID %d post-exec, baseline NOT updated.\n", task->pid);
     }
     spin_unlock_irqrestore(&proc_info_lock, flags);
 
