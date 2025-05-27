@@ -2,6 +2,8 @@
 
 This Linux kernel module monitors process credentials (`struct cred`) for unauthorized modifications. It aims to detect credential tampering attempts, inspired by techniques used in LKRG (Linux Kernel Runtime Guard).
 
+[minidetect.webm](https://github.com/user-attachments/assets/3779385f-b17e-4248-8ae8-2366b654ad97)
+
 ## How it works
 
 1.  **Task tracking:**
